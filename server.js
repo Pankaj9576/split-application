@@ -5,26 +5,52 @@ const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
+const mongoose = require('mongoose');
 const scrapeEspacenetPatent = require('./scrapeEspacenetPatent');
+require('dotenv').config();
 
 const app = express();
 
-// In-memory user store (use database in production)
-const users = [];
+// Validate environment variables
+if (!process.env.JWT_SECRET) {
+  console.error('Error: JWT_SECRET is not defined in .env');
+  process.exit(1);
+}
 
-// JWT secret (use environment variable in production)
-const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
+if (!process.env.MONGODB_URI) {
+  console.error('Error: MONGODB_URI is not defined in .env');
+  process.exit(1);
+}
 
-// CORS middleware
+// MongoDB Connection
+mongoose.connect(`${process.env.MONGODB_URI}/SplitScreenDatabase`, {
+  serverSelectionTimeoutMS: 5000,
+  heartbeatFrequencyMS: 10000,
+})
+  .then(() => console.log('MongoDB Connected'))
+  .catch(err => console.error('MongoDB Connection Error:', err));
+
+// User Schema
+const userSchema = new mongoose.Schema({
+  email: { type: String, required: true, unique: true },
+  password: { type: String, required: true },
+  resetToken: String,
+  resetTokenExpiry: Date,
+  googleId: String,
+});
+const User = mongoose.model('User', userSchema);
+
+// CORS configuration
 app.use(cors({
-  origin: ['https://frontendsplitscreen.vercel.app', 'http://localhost:3000', 'https://split-screen-inky.vercel.app'],
+  origin: process.env.NODE_ENV === 'production'
+    ? 'https://split-screen-inky.vercel.app'
+    : ['http://localhost:3000', 'https://split-screen-inky.vercel.app'],
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
   credentials: true,
   maxAge: 86400,
 }));
 
-// Handle preflight requests
 app.options('*', cors());
 
 // Request logging middleware
@@ -38,10 +64,14 @@ app.use((req, res, next) => {
 
 app.use(express.json());
 
-// Error handling middleware
+// Enhanced error handling middleware
 app.use((err, req, res, next) => {
-  console.error('Server error:', err);
-  res.status(500).json({ error: 'Internal server error' });
+  console.error('Server error:', err.stack);
+  res.status(500).json({
+    error: process.env.NODE_ENV === 'production'
+      ? 'Internal server error'
+      : err.message,
+  });
 });
 
 // Health check endpoint
@@ -55,14 +85,15 @@ app.post('/api/signup', async (req, res) => {
   if (!email || !password) {
     return res.status(400).json({ error: 'Email and password are required' });
   }
-  if (users.find(user => user.email === email)) {
-    return res.status(400).json({ error: 'User already exists' });
-  }
   try {
+    let user = await User.findOne({ email });
+    if (user) {
+      return res.status(400).json({ error: 'User already exists' });
+    }
     const hashedPassword = await bcrypt.hash(password, 10);
-    const user = { email, password: hashedPassword };
-    users.push(user);
-    const token = jwt.sign({ email }, JWT_SECRET, { expiresIn: '1h' });
+    user = new User({ email, password: hashedPassword });
+    await user.save();
+    const token = jwt.sign({ email }, process.env.JWT_SECRET, { expiresIn: '1h' });
     res.status(201).json({ token });
   } catch (err) {
     console.error('Signup error:', err);
@@ -76,16 +107,16 @@ app.post('/api/login', async (req, res) => {
   if (!email || !password) {
     return res.status(400).json({ error: 'Email and password are required' });
   }
-  const user = users.find(user => user.email === email);
-  if (!user) {
-    return res.status(401).json({ error: 'Invalid email or password' });
-  }
   try {
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
     const isMatch = await bcrypt.compare(password, user.password);
     if (!isMatch) {
       return res.status(401).json({ error: 'Invalid email or password' });
     }
-    const token = jwt.sign({ email }, JWT_SECRET, { expiresIn: '1h' });
+    const token = jwt.sign({ email }, process.env.JWT_SECRET, { expiresIn: '1h' });
     res.json({ token });
   } catch (err) {
     console.error('Login error:', err);
@@ -99,17 +130,16 @@ app.post('/api/forgot-password', async (req, res) => {
   if (!email) {
     return res.status(400).json({ error: 'Email is required' });
   }
-  const user = users.find(user => user.email === email);
-  if (!user) {
-    return res.status(404).json({ error: 'User not found' });
-  }
   try {
+    const user = await User.findOne({ email });
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
     const resetToken = crypto.randomBytes(20).toString('hex');
-    const resetTokenExpiry = Date.now() + 3600000;
     user.resetToken = resetToken;
-    user.resetTokenExpiry = resetTokenExpiry;
+    user.resetTokenExpiry = Date.now() + 3600000;
+    await user.save();
     console.log(`Reset Token for ${email}: ${resetToken}`);
-    console.log('Copy the above token and use it to reset the password.');
     res.status(200).json({ message: 'Reset token generated. Check server logs for the token.' });
   } catch (err) {
     console.error('Forgot password error:', err);
@@ -123,18 +153,16 @@ app.post('/api/reset-password', async (req, res) => {
   if (!email || !token || !newPassword) {
     return res.status(400).json({ error: 'Email, token, and new password are required' });
   }
-  const user = users.find(user => user.email === email);
-  if (!user) {
-    return res.status(404).json({ error: 'User not found' });
-  }
-  if (!user.resetToken || user.resetToken !== token || !user.resetTokenExpiry || Date.now() > user.resetTokenExpiry) {
-    return res.status(400).json({ error: 'Invalid or expired reset token' });
-  }
   try {
+    const user = await User.findOne({ email });
+    if (!user || user.resetToken !== token || Date.now() > user.resetTokenExpiry) {
+      return res.status(400).json({ error: 'Invalid or expired reset token' });
+    }
     const hashedPassword = await bcrypt.hash(newPassword, 10);
     user.password = hashedPassword;
     user.resetToken = undefined;
     user.resetTokenExpiry = undefined;
+    await user.save();
     res.status(200).json({ message: 'Password reset successful' });
   } catch (err) {
     console.error('Reset password error:', err);
@@ -148,15 +176,15 @@ app.post('/api/google-login', async (req, res) => {
   if (!email || !googleId) {
     return res.status(400).json({ error: 'Email and Google ID are required' });
   }
-  let user = users.find(user => user.email === email);
-  if (!user) {
-    user = { email, googleId };
-    users.push(user);
-  } else if (user.googleId !== googleId) {
-    return res.status(401).json({ error: 'Invalid Google account' });
-  }
   try {
-    const token = jwt.sign({ email }, JWT_SECRET, { expiresIn: '1h' });
+    let user = await User.findOne({ email });
+    if (!user) {
+      user = new User({ email, googleId });
+      await user.save();
+    } else if (user.googleId && user.googleId !== googleId) {
+      return res.status(401).json({ error: 'Invalid Google account' });
+    }
+    const token = jwt.sign({ email }, process.env.JWT_SECRET, { expiresIn: '1h' });
     res.json({ token });
   } catch (err) {
     console.error('Google login error:', err);
@@ -171,7 +199,7 @@ app.post('/api/verify-token', (req, res) => {
     return res.status(401).json({ valid: false, error: 'No token provided' });
   }
   try {
-    jwt.verify(token, JWT_SECRET);
+    jwt.verify(token, process.env.JWT_SECRET);
     res.json({ valid: true });
   } catch (err) {
     console.error('Token verification error:', err);
@@ -249,11 +277,9 @@ app.get('/api/proxy', async (req, res) => {
   };
 
   try {
-    // Determine token based on original URL
     const token = targetUrl.includes('worldwide.espacenet.com/patent') ? 2 : 1;
     console.log(`Proxy: Assigned token - ${token} (1=Google, 2=Espacenet)`);
 
-    // Convert Espacenet URL to Google Patents URL
     if (targetUrl.includes('worldwide.espacenet.com/patent')) {
       const publicationNumberMatch = targetUrl.match(/([A-Z]{2}\d+[A-Z]\d?)/);
       if (!publicationNumberMatch) {
@@ -480,7 +506,7 @@ app.get('/api/proxy', async (req, res) => {
         const patentData = {
           type: 'patent',
           source: 'google',
-          token: token, // 1 for Google Patents, 2 for Espacenet
+          token: token,
           data: {
             title,
             abstract,
@@ -531,5 +557,3 @@ const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 });
-
-module.exports = app;
