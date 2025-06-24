@@ -146,7 +146,7 @@ app.post('/api/forgot-password', async (req, res) => {
     // Send email
     await sgMail.send({
       to: email,
-      from: 'your-verified-sender@splitscreen.com', // Replace with your verified sender email
+      from: 'sarita@bayslope.com', // Replace with your verified sender email
       subject: 'Password Reset Request',
       html: `Click <a href="${resetLink}">here</a> to reset your password. This link expires in 1 hour.`,
     });
