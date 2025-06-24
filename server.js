@@ -6,8 +6,7 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const mongoose = require('mongoose');
-const nodemailer = require('nodemailer');
-const sgMail = require('@sendgrid/mail');
+const scrapeEspacenetPatent = require('./scrapeEspacenetPatent');
 require('dotenv').config();
 
 const app = express();
@@ -17,34 +16,11 @@ if (!process.env.JWT_SECRET) {
   console.error('Error: JWT_SECRET is not defined in .env');
   process.exit(1);
 }
+
 if (!process.env.MONGODB_URI) {
   console.error('Error: MONGODB_URI is not defined in .env');
   process.exit(1);
 }
-if (!process.env.SENDGRID_API_KEY) {
-  console.error('Error: SENDGRID_API_KEY is not defined in .env');
-  process.exit(1);
-}
-if (!process.env.EMAIL_USER) {
-  console.error('Error: EMAIL_USER is not defined in .env');
-  process.exit(1);
-}
-if (!process.env.EMAIL_PASS) {
-  console.error('Error: EMAIL_PASS is not defined in .env');
-  process.exit(1);
-}
-
-// Configure SendGrid
-sgMail.setApiKey(process.env.SENDGRID_API_KEY);
-
-// Configure Nodemailer (for fallback or testing)
-const transporter = nodemailer.createTransport({
-  service: 'SendGrid', // Using SendGrid as service
-  auth: {
-    user: process.env.EMAIL_USER,
-    pass: process.env.EMAIL_PASS,
-  },
-});
 
 // MongoDB Connection
 mongoose.connect(`${process.env.MONGODB_URI}/SplitScreenDatabase`, {
@@ -161,23 +137,13 @@ app.post('/api/forgot-password', async (req, res) => {
     }
     const resetToken = crypto.randomBytes(20).toString('hex');
     user.resetToken = resetToken;
-    user.resetTokenExpiry = Date.now() + 3600000; // 1 hour expiry
+    user.resetTokenExpiry = Date.now() + 3600000;
     await user.save();
-
-    // Send reset email using SendGrid
-    const resetLink = `http://localhost:3000/reset-password?token=${resetToken}`; // Local URL for now
-    const msg = {
-      to: email,
-      from: process.env.EMAIL_USER, // Must be verified in SendGrid
-      subject: 'Password Reset Request',
-      html: `Click <a href="${resetLink}">here</a> to reset your password. This link expires in 1 hour.`,
-    };
-    await sgMail.send(msg);
-
-    res.status(200).json({ message: 'Password reset email sent. Check your inbox.' });
+    console.log(`Reset Token for ${email}: ${resetToken}`);
+    res.status(200).json({ message: 'Reset token generated. Check server logs for the token.' });
   } catch (err) {
     console.error('Forgot password error:', err);
-    res.status(500).json({ error: 'Failed to send reset email. Please try again.' });
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
