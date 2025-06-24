@@ -1,11 +1,12 @@
 const express = require('express');
-const axios = require('axios'); // Replaced node-fetch with axios for better timeout support
+const fetch = require('node-fetch');
 const cheerio = require('cheerio');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const mongoose = require('mongoose');
-const sgMail = require('@sendgrid/mail');
+const scrapeEspacenetPatent = require('./scrapeEspacenetPatent');
 require('dotenv').config();
 
 const app = express();
@@ -15,44 +16,34 @@ if (!process.env.JWT_SECRET) {
   console.error('Error: JWT_SECRET is not defined in .env');
   process.exit(1);
 }
+
 if (!process.env.MONGODB_URI) {
   console.error('Error: MONGODB_URI is not defined in .env');
   process.exit(1);
 }
-if (!process.env.SENDGRID_API_KEY) {
-  console.error('Error: SENDGRID_API_KEY is not defined in .env');
-  process.exit(1);
-}
-const FROM_EMAIL = process.env.FROM_EMAIL || 'verified-email@yourdomain.com'; // Add as env variable
 
-// Set SendGrid API Key
-sgMail.setApiKey(process.env.SENDGRID_API_KEY);
-
-// MongoDB Connection with Retry Logic
-const connectWithRetry = () => {
-  mongoose.connect(process.env.MONGODB_URI, {
-    serverSelectionTimeoutMS: 5000,
-    heartbeatFrequencyMS: 10000,
-  }).then(() => console.log('MongoDB Connected'))
-    .catch(err => {
-      console.error('MongoDB connection attempt failed:', err);
-      setTimeout(connectWithRetry, 5000); // Retry after 5 seconds
-    });
-};
-connectWithRetry();
+// MongoDB Connection
+mongoose.connect(`${process.env.MONGODB_URI}/SplitScreenDatabase`, {
+  serverSelectionTimeoutMS: 5000,
+  heartbeatFrequencyMS: 10000,
+})
+  .then(() => console.log('MongoDB Connected'))
+  .catch(err => console.error('MongoDB Connection Error:', err));
 
 // User Schema
 const userSchema = new mongoose.Schema({
   email: { type: String, required: true, unique: true },
   password: { type: String, required: true },
+  resetToken: String,
+  resetTokenExpiry: Date,
   googleId: String,
 });
 const User = mongoose.model('User', userSchema);
 
-// CORS Configuration
+// CORS configuration
 app.use(cors({
   origin: process.env.NODE_ENV === 'production'
-    ? ['https://split-screen-inky.vercel.app']
+    ? 'https://split-screen-inky.vercel.app'
     : ['http://localhost:3000', 'https://split-screen-inky.vercel.app'],
   methods: ['GET', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization'],
@@ -62,7 +53,7 @@ app.use(cors({
 
 app.options('*', cors());
 
-// Request Logging Middleware
+// Request logging middleware
 app.use((req, res, next) => {
   console.log(`Request - Method: ${req.method}, Origin: ${req.headers.origin}, Path: ${req.path}`);
   res.on('finish', () => {
@@ -73,18 +64,22 @@ app.use((req, res, next) => {
 
 app.use(express.json());
 
-// Enhanced Error Handling Middleware
+// Enhanced error handling middleware
 app.use((err, req, res, next) => {
   console.error('Server error:', err.stack);
-  res.status(500).json({ error: 'Internal server error' });
+  res.status(500).json({
+    error: process.env.NODE_ENV === 'production'
+      ? 'Internal server error'
+      : err.message,
+  });
 });
 
-// Health Check Endpoint
+// Health check endpoint
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'OK', message: 'Server is running' });
 });
 
-// Signup Endpoint
+// Signup endpoint
 app.post('/api/signup', async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) {
@@ -106,7 +101,7 @@ app.post('/api/signup', async (req, res) => {
   }
 });
 
-// Login Endpoint
+// Login endpoint
 app.post('/api/login', async (req, res) => {
   const { email, password } = req.body;
   if (!email || !password) {
@@ -129,7 +124,7 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// Forgot Password Endpoint
+// Forgot Password endpoint
 app.post('/api/forgot-password', async (req, res) => {
   const { email } = req.body;
   if (!email) {
@@ -140,44 +135,42 @@ app.post('/api/forgot-password', async (req, res) => {
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
-    const resetToken = jwt.sign({ email }, process.env.JWT_SECRET, { expiresIn: '1h' });
-    const resetLink = `https://split-screen-inky.vercel.app/reset-password?token=${resetToken}`;
-    await sgMail.send({
-      to: email,
-      from: FROM_EMAIL,
-      subject: 'Password Reset Request',
-      html: `Click <a href="${resetLink}">here</a> to reset your password. This link expires in 1 hour.`,
-    });
-    res.status(200).json({ message: 'Password reset link sent to your email.' });
+    const resetToken = crypto.randomBytes(20).toString('hex');
+    user.resetToken = resetToken;
+    user.resetTokenExpiry = Date.now() + 3600000;
+    await user.save();
+    console.log(`Reset Token for ${email}: ${resetToken}`);
+    res.status(200).json({ message: 'Reset token generated. Check server logs for the token.' });
   } catch (err) {
     console.error('Forgot password error:', err);
-    res.status(500).json({ error: 'Failed to send reset email. Please try again.' });
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
-// Reset Password Endpoint
+// Reset Password endpoint
 app.post('/api/reset-password', async (req, res) => {
-  const { token, newPassword } = req.body;
-  if (!token || !newPassword) {
-    return res.status(400).json({ error: 'Token and new password are required' });
+  const { email, token, newPassword } = req.body;
+  if (!email || !token || !newPassword) {
+    return res.status(400).json({ error: 'Email, token, and new password are required' });
   }
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findOne({ email: decoded.email });
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
+    const user = await User.findOne({ email });
+    if (!user || user.resetToken !== token || Date.now() > user.resetTokenExpiry) {
+      return res.status(400).json({ error: 'Invalid or expired reset token' });
     }
     const hashedPassword = await bcrypt.hash(newPassword, 10);
     user.password = hashedPassword;
+    user.resetToken = undefined;
+    user.resetTokenExpiry = undefined;
     await user.save();
     res.status(200).json({ message: 'Password reset successful' });
   } catch (err) {
     console.error('Reset password error:', err);
-    res.status(400).json({ error: 'Invalid or expired reset token' });
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
-// Google Login Endpoint
+// Google login endpoint
 app.post('/api/google-login', async (req, res) => {
   const { email, googleId } = req.body;
   if (!email || !googleId) {
@@ -199,7 +192,7 @@ app.post('/api/google-login', async (req, res) => {
   }
 });
 
-// Token Verification Endpoint
+// Token verification endpoint
 app.post('/api/verify-token', (req, res) => {
   const token = req.headers.authorization?.split('Bearer ')[1];
   if (!token) {
@@ -214,15 +207,18 @@ app.post('/api/verify-token', (req, res) => {
   }
 });
 
-// Proxy PDF Endpoint
+// Proxy PDF endpoint
 app.get('/api/proxy-pdf', async (req, res) => {
   const pdfUrl = req.query.url;
-  if (!pdfUrl) return res.status(400).json({ error: 'PDF URL parameter is required' });
+  if (!pdfUrl) {
+    return res.status(400).json({ error: 'PDF URL parameter is required' });
+  }
   try {
     new URL(pdfUrl);
   } catch (e) {
     return res.status(400).json({ error: 'Invalid PDF URL' });
   }
+  console.log(`Proxying PDF: ${pdfUrl}`);
   const fetchHeaders = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
     Accept: 'application/pdf,*/*;q=0.8',
@@ -231,35 +227,44 @@ app.get('/api/proxy-pdf', async (req, res) => {
     Connection: 'keep-alive',
   };
   try {
-    const response = await axios.get(pdfUrl, { headers: fetchHeaders, responseType: 'stream', timeout: 10000 });
-    const contentLength = parseInt(response.headers['content-length'] || '0');
-    if (contentLength > 4 * 1024 * 1024) {
-      return res.status(413).json({ error: 'PDF too large (max 4MB)' });
+    const response = await fetch(pdfUrl, { headers: fetchHeaders });
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`Proxy PDF: Fetch failed - ${response.status} - ${errorText}`);
+      return res.status(response.status).json({ error: `Failed to fetch PDF: ${response.statusText}` });
     }
     res.setHeader('Content-Type', 'application/pdf');
     res.setHeader('Content-Disposition', 'inline; filename=patent.pdf');
     res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition');
-    response.data.pipe(res);
+    response.body.pipe(res);
   } catch (error) {
     console.error('Proxy PDF: Error:', error.message);
     res.status(500).json({ error: `Server error: ${error.message}` });
   }
 });
 
-// Proxy Endpoint
+// Proxy endpoint
 app.get('/api/proxy', async (req, res) => {
+  console.log('Proxy: Request received');
   let targetUrl = req.query.url;
-  if (!targetUrl) return res.status(400).json({ error: 'URL parameter is required' });
+  if (!targetUrl) {
+    console.log('Proxy: URL parameter missing');
+    return res.status(400).json({ error: 'URL parameter is required' });
+  }
   targetUrl = decodeURIComponent(targetUrl);
   if (targetUrl.includes('/api/proxy?url=')) {
     const urlMatch = targetUrl.match(/url=([^&]+)/);
-    if (urlMatch) targetUrl = decodeURIComponent(urlMatch[1]);
+    if (urlMatch) {
+      targetUrl = decodeURIComponent(urlMatch[1]);
+    }
   }
   try {
     new URL(targetUrl);
   } catch (e) {
+    console.log('Proxy: Invalid URL');
     return res.status(400).json({ error: 'Invalid URL' });
   }
+  console.log(`Proxy: Fetching URL - ${targetUrl}`);
   const fetchHeaders = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36',
     Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -278,24 +283,34 @@ app.get('/api/proxy', async (req, res) => {
     if (targetUrl.includes('worldwide.espacenet.com/patent')) {
       const publicationNumberMatch = targetUrl.match(/([A-Z]{2}\d+[A-Z]\d?)/);
       if (!publicationNumberMatch) {
+        console.log('Proxy: Could not extract publication number from Espacenet URL');
         return res.status(400).json({ error: 'Invalid Espacenet URL: Could not extract publication number' });
       }
       const publicationNumber = publicationNumberMatch[0];
       targetUrl = `https://patents.google.com/patent/${publicationNumber}`;
+      console.log(`Proxy: Converted Espacenet URL to Google Patents URL - ${targetUrl}`);
     }
 
-    const response = await axios.get(targetUrl, { headers: fetchHeaders, timeout: 10000 });
-    const contentType = response.headers['content-type'] || 'application/octet-stream';
+    const response = await fetch(targetUrl, { headers: fetchHeaders, redirect: 'follow' });
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`Proxy: Fetch failed - ${response.status} - ${errorText}`);
+      return res.status(response.status).json({ error: `Failed to fetch URL: ${response.statusText}` });
+    }
+    const contentType = response.headers.get('content-type') || 'application/octet-stream';
     res.setHeader('Content-Type', contentType);
 
     if (contentType.includes('text/html')) {
-      const html = response.data;
+      const html = await response.text();
       const $ = cheerio.load(html);
 
       if (targetUrl.includes('patents.google.com/patent')) {
         const title = $('h2#title').text().trim() || $('meta[name="DC.title"]').attr('content')?.trim() || $('h1').text().trim() || $('title').text().trim();
         const abstract = $('div.abstract').text().trim() || $('section[itemprop="abstract"] p').text().trim() || $('abstract').text().trim() || $('div.abstract-text').text().trim();
-        const inventors = $('[itemprop="inventor"]').map((i, el) => $(el).text().trim()).get().filter(name => name) || $('dd[itemprop="inventor"]').map((i, el) => $(el).text().trim()).get() || $('meta[name="DC.contributor"]').map((i, el) => $(el).attr('content')?.trim()).get() || $('span.patent-bibdata-value').filter((i, el) => $(el).prev('span.patent-bibdata-label').text().toLowerCase().includes('inventor')).map((i, el) => $(el).text().trim()).get();
+        const inventors = $('[itemprop="inventor"]').map((i, el) => {
+          const name = $(el).text().trim();
+          return name ? name : null;
+        }).get().filter(name => name !== null) || $('dd[itemprop="inventor"]').map((i, el) => $(el).text().trim()).get() || $('meta[name="DC.contributor"]').map((i, el) => $(el).attr('content')?.trim()).get() || $('span.patent-bibdata-value').filter((i, el) => $(el).prev('span.patent-bibdata-label').text().toLowerCase().includes('inventor')).map((i, el) => $(el).text().trim()).get();
         const publicationNumberRaw = $('span[itemprop="publicationNumber"]').text().trim() || targetUrl.split('/').pop() || $('meta[name="DC.identifier"]').attr('content')?.trim();
         const publicationNumberMatch = publicationNumberRaw?.match(/US\d+B\d/) || [];
         const publicationNumber = publicationNumberMatch[0] || publicationNumberRaw;
@@ -340,7 +355,11 @@ app.get('/api/proxy', async (req, res) => {
 
         const applicationEvents = [];
         $('div.event.layout.horizontal.style-scope.application-timeline').each((i, elem) => {
-          let dateElement = $(elem).find('div.filed, div.reassignment, div.publication, div.granted, div.legal-status').first().text().trim();
+          let dateElement = $(elem)
+            .find('div.filed, div.reassignment, div.publication, div.granted, div.legal-status')
+            .first()
+            .text()
+            .trim();
           if (!dateElement) {
             dateElement = $(elem).find('div').filter((i, el) => {
               const text = $(el).text().trim();
@@ -363,12 +382,21 @@ app.get('/api/proxy', async (req, res) => {
             'MAFP': 'Maintenance fee payment',
           };
           if (filingDate) {
-            applicationEvents.push({ date: filingDate, title: `Application filed by ${assignee || 'Unknown Assignee'}` });
+            applicationEvents.push({
+              date: filingDate,
+              title: `Application filed by ${assignee || 'Unknown Assignee'}`,
+            });
           }
           if (publicationDate) {
-            applicationEvents.push({ date: publicationDate, title: `Publication of ${publicationNumber || 'Unknown Publication'}` });
+            applicationEvents.push({
+              date: publicationDate,
+              title: `Publication of ${publicationNumber || 'Unknown Publication'}`,
+            });
             if (publicationNumber === 'US8900904B2') {
-              applicationEvents.push({ date: '2012-04-19', title: 'Publication of US20120091551A1' });
+              applicationEvents.push({
+                date: '2012-04-19',
+                title: 'Publication of US20120091551A1',
+              });
             }
           }
           legalEvents.forEach(event => {
@@ -391,11 +419,15 @@ app.get('/api/proxy', async (req, res) => {
           return new Date(a.date) - new Date(b.date);
         });
 
+        console.log('Extracted Application Events:', JSON.stringify(applicationEvents, null, 2));
+        console.log('Raw HTML Snippet for Application Timeline:', $('div.wrap.style-scope.application-timeline').html()?.slice(0, 2000) || 'No timeline found');
+
         const drawingsFromCarousel = [];
         $('meta[itemprop="full"]').each((i, elem) => {
           const content = $(elem).attr('content');
           if (content) drawingsFromCarousel.push(content);
         });
+        console.log('Extracted images:', drawingsFromCarousel);
 
         const claims = $('section[itemprop="claims"]').html() || $('div.claims').html() || $('div#claims').html() || '';
         const description = $('section[itemprop="description"]').html() || $('div.description').html() || $('div#description').html() || '';
@@ -409,12 +441,18 @@ app.get('/api/proxy', async (req, res) => {
         let pdfUrl = null;
         const pdfEndpoint = targetUrl.endsWith('/') ? `${targetUrl}pdf` : `${targetUrl}/pdf`;
         try {
-          const pdfResponse = await axios.head(pdfEndpoint, { headers: fetchHeaders, timeout: 5000 });
-          if (pdfResponse.status === 200) {
-            const redirectedUrl = pdfResponse.request.res.responseUrl;
-            if (redirectedUrl.includes('patentimages.storage.googleapis.com') && redirectedUrl.endsWith('.pdf')) {
+          console.log(`Attempting to fetch PDF endpoint: ${pdfEndpoint}`);
+          const pdfResponse = await fetch(pdfEndpoint, { headers: fetchHeaders, redirect: 'follow', method: 'HEAD' });
+          if (pdfResponse.ok) {
+            const redirectedUrl = pdfResponse.url;
+            console.log(`PDF endpoint redirected to: ${redirectedUrl}`);
+            if (redirectedUrl && redirectedUrl.includes('patentimages.storage.googleapis.com') && redirectedUrl.endsWith('.pdf')) {
               pdfUrl = redirectedUrl;
+            } else {
+              console.log('Redirected URL does not match expected PDF pattern.');
             }
+          } else {
+            console.log(`PDF endpoint fetch failed with status: ${pdfResponse.status}`);
           }
         } catch (err) {
           console.error('Failed to fetch PDF endpoint:', err.message);
@@ -428,32 +466,40 @@ app.get('/api/proxy', async (req, res) => {
           });
           if (possiblePdfLinks.length > 0) {
             let href = possiblePdfLinks.first().attr('href');
+            console.log(`Fallback: Found potential PDF link in HTML: ${href}`);
             if (href) {
               href = href.startsWith('http') ? href : `https://patents.google.com${href}`;
               try {
-                const verifyResponse = await axios.head(href, { headers: fetchHeaders, timeout: 5000 });
-                if (verifyResponse.status === 200) {
-                  const finalUrl = verifyResponse.request.res.responseUrl;
+                const verifyResponse = await fetch(href, { headers: fetchHeaders, redirect: 'follow', method: 'HEAD' });
+                if (verifyResponse.ok) {
+                  const finalUrl = verifyResponse.url;
+                  console.log(`Fallback: Verified PDF URL after redirect: ${finalUrl}`);
                   if (finalUrl.includes('patentimages.storage.googleapis.com') && finalUrl.endsWith('.pdf')) {
                     pdfUrl = finalUrl;
                   }
                 }
               } catch (err) {
-                console.error('Failed to verify PDF URL:', err.message);
+                console.error('Fallback: Failed to verify PDF URL:', err.message);
               }
             }
+          } else {
+            console.log('Fallback: No PDF URL found in HTML after enhanced search.');
           }
         }
 
         if (!pdfUrl && publicationNumber) {
           const constructedPdfUrl = `https://patentimages.storage.googleapis.com/patents/${publicationNumber.toLowerCase()}.pdf`;
           try {
-            const verifyResponse = await axios.head(constructedPdfUrl, { headers: fetchHeaders, timeout: 5000 });
-            if (verifyResponse.status === 200) {
+            console.log(`Final Fallback: Attempting constructed PDF URL: ${constructedPdfUrl}`);
+            const verifyResponse = await fetch(constructedPdfUrl, { headers: fetchHeaders, redirect: 'follow', method: 'HEAD' });
+            if (verifyResponse.ok) {
               pdfUrl = constructedPdfUrl;
+              console.log('Final Fallback: Constructed PDF URL is valid.');
+            } else {
+              console.log('Final Fallback: Constructed PDF URL is not valid.');
             }
           } catch (err) {
-            console.error('Failed to verify constructed PDF URL:', err.message);
+            console.error('Final Fallback: Failed to verify constructed PDF URL:', err.message);
           }
         }
 
@@ -486,19 +532,20 @@ app.get('/api/proxy', async (req, res) => {
           },
         };
 
+        console.log('Extracted Patent Data:', JSON.stringify(patentData, null, 2));
         res.json(patentData);
       } else {
         res.setHeader('Content-Disposition', 'inline');
-        res.send(html);
+        response.body.pipe(res);
       }
     } else if (contentType.includes('application/pdf')) {
       res.setHeader('Content-Type', 'application/pdf');
       res.setHeader('Content-Disposition', 'inline; filename=patent.pdf');
       res.setHeader('Access-Control-Expose-Headers', 'Content-Disposition');
-      res.send(response.data);
+      response.body.pipe(res);
     } else {
       res.setHeader('Content-Disposition', 'inline');
-      res.send(response.data);
+      response.body.pipe(res);
     }
   } catch (error) {
     console.error('Proxy: Error:', error.message);
