@@ -4,9 +4,9 @@ const cheerio = require('cheerio');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
-const crypto = require('crypto');
 const mongoose = require('mongoose');
-const scrapeEspacenetPatent = require('./scrapeEspacenetPatent');
+const nodemailer = require('nodemailer');
+const sgMail = require('@sendgrid/mail');
 require('dotenv').config();
 
 const app = express();
@@ -16,11 +16,17 @@ if (!process.env.JWT_SECRET) {
   console.error('Error: JWT_SECRET is not defined in .env');
   process.exit(1);
 }
-
 if (!process.env.MONGODB_URI) {
   console.error('Error: MONGODB_URI is not defined in .env');
   process.exit(1);
 }
+if (!process.env.SENDGRID_API_KEY) {
+  console.error('Error: SENDGRID_API_KEY is not defined in .env');
+  process.exit(1);
+}
+
+// Set SendGrid API Key
+sgMail.setApiKey(process.env.SENDGRID_API_KEY);
 
 // MongoDB Connection
 mongoose.connect(`${process.env.MONGODB_URI}/SplitScreenDatabase`, {
@@ -34,8 +40,6 @@ mongoose.connect(`${process.env.MONGODB_URI}/SplitScreenDatabase`, {
 const userSchema = new mongoose.Schema({
   email: { type: String, required: true, unique: true },
   password: { type: String, required: true },
-  resetToken: String,
-  resetTokenExpiry: Date,
   googleId: String,
 });
 const User = mongoose.model('User', userSchema);
@@ -135,38 +139,44 @@ app.post('/api/forgot-password', async (req, res) => {
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
-    const resetToken = crypto.randomBytes(20).toString('hex');
-    user.resetToken = resetToken;
-    user.resetTokenExpiry = Date.now() + 3600000;
-    await user.save();
-    console.log(`Reset Token for ${email}: ${resetToken}`);
-    res.status(200).json({ message: 'Reset token generated. Check server logs for the token.' });
+    // Generate JWT reset token
+    const resetToken = jwt.sign({ email }, process.env.JWT_SECRET, { expiresIn: '1h' });
+    // Create reset link
+    const resetLink = `https://split-screen-inky.vercel.app/reset-password?token=${resetToken}`;
+    // Send email
+    await sgMail.send({
+      to: email,
+      from: 'your-verified-sender@splitscreen.com', // Replace with your verified sender email
+      subject: 'Password Reset Request',
+      html: `Click <a href="${resetLink}">here</a> to reset your password. This link expires in 1 hour.`,
+    });
+    res.status(200).json({ message: 'Password reset link sent to your email.' });
   } catch (err) {
     console.error('Forgot password error:', err);
-    res.status(500).json({ error: 'Server error' });
+    res.status(500).json({ error: 'Failed to send reset email. Please try again.' });
   }
 });
 
 // Reset Password endpoint
 app.post('/api/reset-password', async (req, res) => {
-  const { email, token, newPassword } = req.body;
-  if (!email || !token || !newPassword) {
-    return res.status(400).json({ error: 'Email, token, and new password are required' });
+  const { token, newPassword } = req.body;
+  if (!token || !newPassword) {
+    return res.status(400).json({ error: 'Token and new password are required' });
   }
   try {
-    const user = await User.findOne({ email });
-    if (!user || user.resetToken !== token || Date.now() > user.resetTokenExpiry) {
-      return res.status(400).json({ error: 'Invalid or expired reset token' });
+    // Verify JWT token
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const user = await User.findOne({ email: decoded.email });
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
     }
     const hashedPassword = await bcrypt.hash(newPassword, 10);
     user.password = hashedPassword;
-    user.resetToken = undefined;
-    user.resetTokenExpiry = undefined;
     await user.save();
     res.status(200).json({ message: 'Password reset successful' });
   } catch (err) {
     console.error('Reset password error:', err);
-    res.status(500).json({ error: 'Server error' });
+    res.status(400).json({ error: 'Invalid or expired reset token' });
   }
 });
 
